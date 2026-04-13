@@ -1,3 +1,67 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* =========================================================
+   인쇄 스타일
+   ========================================================= */
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    size: A4 landscape;
+    margin: 8mm;
+  }
+
+  html,
+  body {
+    background: white !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .print-area {
+    padding: 0 !important;
+    max-width: none !important;
+  }
+
+  .print-seat-card {
+    border: none !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  .seat-grid-wrapper {
+    overflow: visible !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /*
+   * A4 가로(297mm) 기준으로 좌석 그리드를 맞추기 위한 스케일.
+   * GRID_TOTAL_WIDTH ≈ 1700px 기준으로 역산: 297mm / 1700px ≈ 0.62
+   */
+  .seat-grid-inner {
+    transform: scale(0.62);
+    transform-origin: top left;
+    width: 162%; /* 1 / 0.62 ≈ 1.613 */
+  }
+
+  .print-stage {
+    background: #1e293b !important;
+  }
+
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
