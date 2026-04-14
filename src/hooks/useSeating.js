@@ -3,17 +3,8 @@ import * as XLSX from "xlsx";
 import { DEFAULT_COLOR, COLOR_PALETTE } from "../constants/colors";
 import { seatId, ALL_ROWS, ALL_SEAT_IDS } from "../constants/seats";
 
-const STORAGE_KEY = "cts_seating_v1";
-
-function loadFromStorage() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
+const ROOM_ID = "default";
+const POLL_INTERVAL_MS = 3000;
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -25,9 +16,8 @@ function downloadBlob(blob, filename) {
 }
 
 export function useSeating() {
-  // 초기 로드는 한 번만
-  const [people, setPeople] = useState(() => loadFromStorage()?.people || []);
-  const [categories, setCategories] = useState(() => loadFromStorage()?.categories || []);
+  const [people, setPeople] = useState([]);
+  const [categories, setCategories] = useState([]);
   const [view, setView] = useState("seats");
   const [searchTerm, setSearchTerm] = useState("");
   const [selectedPerson, setSelectedPerson] = useState(null);
@@ -40,29 +30,146 @@ export function useSeating() {
   const [savedToast, setSavedToast] = useState(false);
   const [errorToast, setErrorToast] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
+  const [isSyncing, setIsSyncing] = useState(true);
+
+  const peopleRef = useRef([]);
+  const categoriesRef = useRef([]);
+  const versionRef = useRef(1);
+  const saveQueueRef = useRef(Promise.resolve());
+  const pendingSaveCountRef = useRef(0);
+  const initializedRef = useRef(false);
+  const saveTimerRef = useRef(null);
 
   const showError = useCallback((msg) => {
+    clearTimeout(saveTimerRef.current);
     setErrorToast(msg);
-    setTimeout(() => setErrorToast(null), 3000);
+    saveTimerRef.current = setTimeout(() => setErrorToast(null), 3000);
   }, []);
 
   const askConfirm = useCallback((title, message, onConfirm, danger = false) => {
     setConfirmState({ title, message, onConfirm, danger });
   }, []);
 
-  // 자동 저장 — 디바운스(250ms)로 불필요한 직렬화 최소화
-  const saveTimerRef = useRef(null);
   useEffect(() => {
-    clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ people, categories }));
-      } catch {
-        // localStorage 사용 불가 환경 (시크릿 모드, iframe 제약 등) — 무시
-      }
-    }, 250);
     return () => clearTimeout(saveTimerRef.current);
-  }, [people, categories]);
+  }, []);
+
+  useEffect(() => {
+    peopleRef.current = people;
+  }, [people]);
+
+  useEffect(() => {
+    categoriesRef.current = categories;
+  }, [categories]);
+
+  const syncSharedState = useCallback((nextPeople, nextCategories) => {
+    peopleRef.current = nextPeople;
+    categoriesRef.current = nextCategories;
+    setPeople(nextPeople);
+    setCategories(nextCategories);
+  }, []);
+
+  const fetchState = useCallback(async ({ silent = false } = {}) => {
+    if (silent && pendingSaveCountRef.current > 0) return;
+    if (!silent) setIsSyncing(true);
+
+    try {
+      const res = await fetch(`/api/state?roomId=${encodeURIComponent(ROOM_ID)}`, {
+        cache: "no-store",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "서버 상태를 불러오지 못했습니다");
+      }
+
+      syncSharedState(
+        Array.isArray(data.payload?.people) ? data.payload.people : [],
+        Array.isArray(data.payload?.categories) ? data.payload.categories : [],
+      );
+      versionRef.current = Number.isInteger(data.version) ? data.version : 1;
+      initializedRef.current = true;
+    } catch (err) {
+      if (!silent) {
+        showError("동기화 실패: " + err.message);
+      }
+    } finally {
+      if (!silent) setIsSyncing(false);
+    }
+  }, [showError, syncSharedState]);
+
+  useEffect(() => {
+    fetchState();
+    const timerId = setInterval(() => {
+      void fetchState({ silent: true });
+    }, POLL_INTERVAL_MS);
+
+    return () => clearInterval(timerId);
+  }, [fetchState]);
+
+  const enqueueSave = useCallback((nextPeople, nextCategories) => {
+    saveQueueRef.current = saveQueueRef.current.then(async () => {
+      pendingSaveCountRef.current += 1;
+      try {
+        const res = await fetch("/api/state", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            roomId: ROOM_ID,
+            version: versionRef.current,
+            payload: {
+              people: nextPeople,
+              categories: nextCategories,
+            },
+          }),
+        });
+        const data = await res.json();
+
+        if (res.status === 409 || data.code === "VERSION_CONFLICT") {
+          syncSharedState(
+            Array.isArray(data.payload?.people) ? data.payload.people : [],
+            Array.isArray(data.payload?.categories) ? data.payload.categories : [],
+          );
+          versionRef.current = Number.isInteger(data.version) ? data.version : versionRef.current;
+          throw new Error("다른 사용자의 변경이 먼저 반영되었습니다. 최신 상태를 불러왔습니다.");
+        }
+
+        if (!res.ok) {
+          throw new Error(data.error || "서버 저장에 실패했습니다");
+        }
+
+        versionRef.current = Number.isInteger(data.version) ? data.version : versionRef.current + 1;
+      } finally {
+        pendingSaveCountRef.current = Math.max(0, pendingSaveCountRef.current - 1);
+      }
+    });
+
+    return saveQueueRef.current.catch((err) => {
+      showError(err.message);
+      return null;
+    });
+  }, [showError, syncSharedState]);
+
+  const commitSharedState = useCallback((updater) => {
+    if (!initializedRef.current) {
+      showError("초기 동기화가 끝난 뒤 다시 시도해 주세요.");
+      return;
+    }
+
+    const current = {
+      people: peopleRef.current,
+      categories: categoriesRef.current,
+    };
+    const next = updater(current);
+    if (!next) return;
+
+    const nextPeople = Array.isArray(next.people) ? next.people : current.people;
+    const nextCategories = Array.isArray(next.categories) ? next.categories : current.categories;
+
+    syncSharedState(nextPeople, nextCategories);
+    void enqueueSave(nextPeople, nextCategories);
+  }, [enqueueSave, showError, syncSharedState]);
 
   // seatId → person O(1) 맵
   const seatMap = useMemo(() => {
@@ -124,7 +231,10 @@ export function useSeating() {
           name, position, affiliation: aff, seatId: null, categoryId: null,
         });
       }
-      setPeople(prev => [...prev, ...newPeople]);
+      commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+        people: [...currentPeople, ...newPeople],
+        categories: currentCategories,
+      }));
       e.target.value = "";
     } catch (err) {
       showError("엑셀 파일 오류: " + err.message);
@@ -146,32 +256,47 @@ export function useSeating() {
 
   const addPerson = (name, position, affiliation) => {
     if (!name.trim()) return;
-    setPeople(prev => [...prev, {
-      id: crypto.randomUUID(),
-      name: name.trim(), position: (position || "").trim(), affiliation: affiliation.trim(),
-      seatId: null, categoryId: null,
-    }]);
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: [...currentPeople, {
+        id: crypto.randomUUID(),
+        name: name.trim(), position: (position || "").trim(), affiliation: affiliation.trim(),
+        seatId: null, categoryId: null,
+      }],
+      categories: currentCategories,
+    }));
   };
 
   const removePerson = (id) => {
-    setPeople(prev => prev.filter(p => p.id !== id));
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople.filter(p => p.id !== id),
+      categories: currentCategories,
+    }));
     if (selectedPerson?.id === id) setSelectedPerson(null);
     if (detailPerson?.id === id) setDetailPerson(null);
   };
 
   const unassignSeat = (id) => {
-    setPeople(prev => prev.map(p => p.id === id ? { ...p, seatId: null } : p));
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople.map(p => p.id === id ? { ...p, seatId: null } : p),
+      categories: currentCategories,
+    }));
   };
 
   const setPersonCategory = (personId, categoryId) => {
-    setPeople(prev => prev.map(p => p.id === personId ? { ...p, categoryId } : p));
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople.map(p => p.id === personId ? { ...p, categoryId } : p),
+      categories: currentCategories,
+    }));
   };
 
   const resetAll = () => {
     askConfirm(
       "배치 초기화",
       "모든 좌석 배치를 초기화하시겠습니까? (인원 명단은 유지됩니다)",
-      () => setPeople(prev => prev.map(p => ({ ...p, seatId: null }))),
+      () => commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+        people: currentPeople.map(p => ({ ...p, seatId: null })),
+        categories: currentCategories,
+      })),
       true
     );
   };
@@ -180,7 +305,7 @@ export function useSeating() {
   const handleSavePreset = () => {
     const data = { version: 1, savedAt: new Date().toISOString(), people, categories };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const ts = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    const ts = new Date().toISOString().slice(0, 16).replaceAll("-", "").replaceAll(":", "").replace("T", "");
     downloadBlob(blob, `CTS_좌석프리셋_${ts}.json`);
     setSavedToast(true);
     setTimeout(() => setSavedToast(false), 2000);
@@ -200,10 +325,10 @@ export function useSeating() {
       askConfirm(
         "프리셋 불러오기",
         `프리셋을 불러오면 현재 데이터가 모두 교체됩니다. (인원 ${data.people.length}명, 카테고리 ${(data.categories || []).length}개) 계속하시겠습니까?`,
-        () => {
-          setPeople(data.people);
-          setCategories(data.categories || []);
-        }
+        () => commitSharedState(() => ({
+          people: data.people,
+          categories: data.categories || [],
+        }))
       );
     } catch (err) {
       showError("프리셋 파일을 불러올 수 없습니다: " + err.message);
@@ -215,7 +340,7 @@ export function useSeating() {
     askConfirm(
       "전체 데이터 삭제",
       "모든 데이터(인원, 카테고리, 배치)를 완전히 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
-      () => { setPeople([]); setCategories([]); },
+      () => commitSharedState(() => ({ people: [], categories: [] })),
       true
     );
   };
@@ -258,9 +383,10 @@ export function useSeating() {
 
     const unplacedCount = Math.max(0, sortedPeople.length - availableSeats.length);
 
-    setPeople(prev =>
-      prev.map(p => assignments.has(p.id) ? { ...p, seatId: assignments.get(p.id) } : p)
-    );
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople.map(p => assignments.has(p.id) ? { ...p, seatId: assignments.get(p.id) } : p),
+      categories: currentCategories,
+    }));
 
     if (unplacedCount > 0) showError(`좌석이 부족합니다: ${unplacedCount}명 미배치`);
   };
@@ -268,21 +394,24 @@ export function useSeating() {
   // ====== 카테고리 관리 ======
   const addCategory = (name, colorIndex) => {
     if (!name.trim()) return;
-    setCategories(prev => [...prev, {
-      id: crypto.randomUUID(),
-      name: name.trim(),
-      color: COLOR_PALETTE[colorIndex % COLOR_PALETTE.length],
-    }]);
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople,
+      categories: [...currentCategories, {
+        id: crypto.randomUUID(),
+        name: name.trim(),
+        color: COLOR_PALETTE[colorIndex % COLOR_PALETTE.length],
+      }],
+    }));
   };
 
   const removeCategory = (id) => {
     askConfirm(
       "카테고리 삭제",
       "카테고리를 삭제하시겠습니까? 이 카테고리의 인원은 기본 색으로 돌아갑니다.",
-      () => {
-        setCategories(prev => prev.filter(c => c.id !== id));
-        setPeople(prev => prev.map(p => p.categoryId === id ? { ...p, categoryId: null } : p));
-      },
+      () => commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+        people: currentPeople.map(p => p.categoryId === id ? { ...p, categoryId: null } : p),
+        categories: currentCategories.filter(c => c.id !== id),
+      })),
       true
     );
   };
@@ -308,14 +437,17 @@ export function useSeating() {
   const handleSeatDrop = (sid) => (e) => {
     e.preventDefault();
     if (!draggingPerson) return;
-    setPeople(prev => {
-      const existing = prev.find(p => p.seatId === sid);
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => {
+      const existing = currentPeople.find(p => p.seatId === sid);
       const draggingOldSeat = draggingPerson.seatId;
-      return prev.map(p => {
-        if (p.id === draggingPerson.id) return { ...p, seatId: sid };
-        if (existing && p.id === existing.id) return { ...p, seatId: draggingOldSeat };
-        return p;
-      });
+      return {
+        people: currentPeople.map(p => {
+          if (p.id === draggingPerson.id) return { ...p, seatId: sid };
+          if (existing && p.id === existing.id) return { ...p, seatId: draggingOldSeat };
+          return p;
+        }),
+        categories: currentCategories,
+      };
     });
     setDraggingPerson(null);
     setHighlightedSeat(null);
@@ -328,7 +460,10 @@ export function useSeating() {
       return;
     }
     if (selectedPerson && !selectedPerson.seatId) {
-      setPeople(prev => prev.map(p => p.id === selectedPerson.id ? { ...p, seatId: sid } : p));
+      commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+        people: currentPeople.map(p => p.id === selectedPerson.id ? { ...p, seatId: sid } : p),
+        categories: currentCategories,
+      }));
       setSelectedPerson(null);
     } else {
       setSeatPickerSeatId(sid);
@@ -336,7 +471,10 @@ export function useSeating() {
   };
 
   const assignPersonToSeat = (personId, sid) => {
-    setPeople(prev => prev.map(p => p.id === personId ? { ...p, seatId: sid } : p));
+    commitSharedState(({ people: currentPeople, categories: currentCategories }) => ({
+      people: currentPeople.map(p => p.id === personId ? { ...p, seatId: sid } : p),
+      categories: currentCategories,
+    }));
     setSeatPickerSeatId(null);
   };
 
@@ -362,6 +500,7 @@ export function useSeating() {
     seatPickerSeatId, setSeatPickerSeatId,
     savedToast, errorToast,
     confirmState, setConfirmState,
+    isSyncing,
     // derived
     seatMap, unassignedPeople, assignedCount, liveDetailPerson, filteredPeople,
     // actions

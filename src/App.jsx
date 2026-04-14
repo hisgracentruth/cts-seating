@@ -30,6 +30,7 @@ export default function CTSSeatingApp() {
     seatPickerSeatId, setSeatPickerSeatId,
     savedToast, errorToast,
     confirmState, setConfirmState,
+    isSyncing,
     seatMap, unassignedPeople, assignedCount, liveDetailPerson, filteredPeople,
     getCategory, getPersonColor,
     handleExcelUpload, handleExport,
@@ -54,6 +55,9 @@ export default function CTSSeatingApp() {
               <h1 className="text-sm sm:text-xl font-bold tracking-tight whitespace-nowrap">아트홀 좌석 관리</h1>
               <p className="text-[10px] sm:text-sm text-slate-500 whitespace-nowrap hidden sm:block">
                 총 {ALL_SEAT_IDS.length}석 · 등록 {people.length}명 · 배치 {assignedCount}명
+              </p>
+              <p className="text-[10px] text-emerald-600 whitespace-nowrap hidden sm:block">
+                {isSyncing ? "공용 상태 동기화 중" : "공용 상태 연결됨"}
               </p>
             </div>
           </div>
